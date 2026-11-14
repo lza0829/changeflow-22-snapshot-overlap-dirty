@@ -92,6 +92,21 @@ function statusClass(status) {
   return 'warn'
 }
 
+// Sink 对账表：实际/预期取并集，缺哪边就显示缺失，便于一眼看出同键脏行
+function sinkKeys(recon) {
+  const keys = new Set([
+    ...Object.keys(recon.sink.actual || {}),
+    ...Object.keys(recon.sink.expected || {}),
+  ])
+  return [...keys].sort()
+}
+
+function sinkRowMismatch(recon, key) {
+  const a = recon.sink.actual[key]
+  const e = recon.sink.expected[key]
+  return JSON.stringify(a) !== JSON.stringify(e)
+}
+
 onMounted(refreshAll)
 </script>
 <template>
@@ -131,21 +146,29 @@ onMounted(refreshAll)
           {{ recon.status === 'caught_up' ? '已追上 caught_up' : recon.status === 'catching_up' ? '追平中 catching_up' : recon.status }}
         </span>
         <span class="muted" style="margin-left: .6rem">
-          游标 {{ recon.cursor.apply_cursor }} / live 最大 seq {{ recon.cursor.live_max_seq }}
+          游标 {{ recon.cursor.apply_cursor }} / 快照界 watermark {{ recon.cursor.watermark_seq ?? '—' }} /
+          live 最大 seq {{ recon.cursor.live_max_seq }}
         </span>
       </h3>
+      <p class="muted" v-if="recon.status !== 'caught_up'">
+        尚未追上：游标 {{ recon.cursor.apply_cursor }} 仍在 live 末端 {{ recon.cursor.live_max_seq }} 之前，
+        不标完成、不写追上时间；继续「追 Live」直到全量 live seq 消化完毕。
+      </p>
       <div class="tiles">
         <div class="tile"><div class="hero-num">{{ recon.snapshot_record.row_count }}</div><div class="muted">快照行数</div></div>
-        <div class="tile"><div class="hero-num">{{ recon.snapshot_record.live_candidate_count }}</div><div class="muted">live 候选（去重 seq）</div></div>
-        <div class="tile"><div class="hero-num">{{ recon.snapshot_record.overlap_skipped_count }}</div><div class="muted">重叠跳过</div></div>
+        <div class="tile"><div class="hero-num">{{ recon.snapshot_record.live_candidate_count }}</div><div class="muted">live 候选（已消化 seq）</div></div>
+        <div class="tile"><div class="hero-num">{{ recon.snapshot_record.overlap_skipped_count }}</div><div class="muted">重叠跳过（不落 Sink）</div></div>
         <div class="tile"><div class="hero-num">{{ recon.snapshot_record.applied_count }}</div><div class="muted">真正 applied</div></div>
         <div class="tile"><div class="hero-num">{{ recon.snapshot_record.duplicate_skipped_count }}</div><div class="muted">重复幂等吞掉</div></div>
         <div class="tile"><div class="hero-num">{{ recon.snapshot_record.cursor_after }}</div><div class="muted">快照记录游标</div></div>
       </div>
-      <h4>四方对账（快照记录 / 账本 / Sink / 游标）</h4>
+      <h4>四方对账（快照记录 / 账本 / Sink / 游标 / 状态机）</h4>
       <p>
-        <span class="tag" :class="recon.all_match ? 'ok' : 'warn'">
-          {{ recon.all_match ? '全部对上号' : '存在未对上项（追平中属正常）' }}
+        <span class="tag" :class="recon.all_match ? 'ok' : 'danger'">
+          {{ recon.all_match ? '全部对上号' : '存在未对上项' }}
+        </span>
+        <span class="muted" style="margin-left: .6rem">
+          追平中与追上后都应全绿：重叠跳过不得引入额外 Sink 脏行，未追上不得伪造游标。
         </span>
       </p>
       <table>
@@ -153,7 +176,7 @@ onMounted(refreshAll)
         <tbody>
           <tr v-for="c in recon.checks" :key="c.name">
             <td>{{ c.name }}</td>
-            <td><span class="tag" :class="c.ok ? 'ok' : 'warn'">{{ c.ok ? 'OK' : '待对上' }}</span></td>
+            <td><span class="tag" :class="c.ok ? 'ok' : 'danger'">{{ c.ok ? 'OK' : '不成立' }}</span></td>
             <td class="muted mono">{{ c.detail }}</td>
           </tr>
         </tbody>
@@ -201,19 +224,30 @@ onMounted(refreshAll)
     </div>
 
     <div class="panel" v-if="recon">
-      <h3>Sink 对账：实际态 vs 全量 CDC 折叠预期态</h3>
+      <h3>Sink 对账：实际态 vs 预期态（快照 + 已 applied）</h3>
       <p class="muted">
         实际 {{ recon.sink.actual_count }} 行 / 预期 {{ recon.sink.expected_count }} 行；
-        重叠区被跳过的旧 upsert 不会让已删除实体复活，也不会同键多出脏行。
+        重叠区跳过是纯读侧裁决——不重放旧 upsert（不让已删实体复活），也不重放旧 delete
+        （不抹掉快照行），同键不会多出脏行。{{
+          recon.sink.dirty_overlap_keys && recon.sink.dirty_overlap_keys.length
+            ? `脏键：${recon.sink.dirty_overlap_keys.join('、')}`
+            : '脏键：无'
+        }}
       </p>
       <table>
-        <thead><tr><th>entity_key</th><th>实际 payload</th><th>预期 payload</th></tr></thead>
+        <thead><tr><th>entity_key</th><th>实际 payload</th><th>预期 payload</th><th>一致</th></tr></thead>
         <tbody>
-          <tr v-for="(payload, key) in recon.sink.actual" :key="key">
+          <tr v-for="key in sinkKeys(recon)" :key="key">
             <td>{{ key }}</td>
-            <td><pre class="mono">{{ JSON.stringify(payload) }}</pre></td>
-            <td><pre class="mono">{{ JSON.stringify(recon.sink.expected[key]) }}</pre></td>
+            <td><pre class="mono">{{ recon.sink.actual[key] === undefined ? '（Sink 中缺失）' : JSON.stringify(recon.sink.actual[key]) }}</pre></td>
+            <td><pre class="mono">{{ recon.sink.expected[key] === undefined ? '（预期中不存在）' : JSON.stringify(recon.sink.expected[key]) }}</pre></td>
+            <td>
+              <span class="tag" :class="sinkRowMismatch(recon, key) ? 'danger' : 'ok'">
+                {{ sinkRowMismatch(recon, key) ? '不一致' : 'OK' }}
+              </span>
+            </td>
           </tr>
+          <tr v-if="!sinkKeys(recon).length"><td colspan="4" class="muted">Sink 为空</td></tr>
         </tbody>
       </table>
     </div>

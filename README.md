@@ -44,25 +44,38 @@ cd frontend && npm install && npm run dev
    实体态直接灌进同一 Sink 底座（`UNIQUE(stream_id, entity_key)` 兜底，同键不会出脏行），
    同时落 `snapshot_imports` 记录（含 snapshot_id、快照时间、`watermark_seq=5`、行数），
    每行在账本记 `snapshot_loaded`，记录可回看且持久化。
-2. **追 Live**：只认真处理 `seq > watermark_seq` 的变更；可填「本批上限」分批追，
-   追平中状态机显示 `catching_up`、`caught_up_at` 为空，一眼能看出尚未追上；
-   游标推进到 live 最大 seq 才置 `caught_up` 并写追上时间。
-3. **四方对账**：快照记录 / 账本 / Sink / 游标四处计数与 seq 集合逐项核对，
+2. **追 Live**：只认真处理 `seq > watermark_seq` 的变更；可填「本批上限」分批追。
+   状态机只有两个变量：已消费到哪（游标）与 live seq 是否全部消化。
+   游标表示「已消费位置」（applied 或重叠跳过都算消费，重复吞掉不算），
+   重叠区跳过只会把游标推进到快照界内，绝不会预支到 live 末端；
+   只有「全量 live seq 都已消化 **且** 游标到达 live 最大 seq」才置 `caught_up` 并写追上时间，
+   否则一律停在 `catching_up` 且 `caught_up_at` 为空。
+3. **四方对账**：快照记录 / 账本 / Sink / 游标（外加状态机自洽）逐项核对，
+   **追平中与追上后都应全绿**：重叠跳过不得让 Sink 多出任何行，
+   未追上不得标完成、不得出现越过 live 末端的游标。
    全部落 SQLite，关掉浏览器再开状态仍在；页内提供「重置该 Lane」重新演示。
 
 公布的重叠消化规则：
 
 - `seq <= watermark_seq`：变更已折叠进快照 → 账本记 `skipped_snapshot_overlap` 跳过，
-  不重放。快照中缺席本身就是结论（实体在快照前已删除），重放旧事件会造脏行/让删除复活；
+  **不碰 Sink、不重放**。快照中缺席本身就是结论（实体在快照前已删除）——
+  重放旧 upsert 会让它复活成同键脏行，重放旧 delete 又会抹掉快照里仍在的行；
 - watermark 之后但已应用过的 seq（重跑）→ `skipped_duplicate` 幂等吞掉；
 - 其余 live 变更 → 按 upsert/delete 幂等落到同一实体键。
+
+对账恒等式（追平中/追上后都成立）：
+
+- `Sink 实际态 == 快照态 + 仅已 applied 的 live 折叠`（重叠区零副作用）；
+- `Sink 键集 ⊆ 快照键 ∪ watermark 之后的 live 键`，且不含「只被重叠区触碰、快照中缺席」的脏键；
+- `游标 == 已消费最大 seq`；有 applied 时游标必须越过 watermark，没有时只能停在界内。
 
 样例（`orders_snapshot.jsonl` + `orders_snapshot_lane_cdc.jsonl`）：
 
 - 快照 2 行（ORD-1001、ORD-1003，watermark=5）；live 共 seq 1→10；
-- seq1..5 落重叠区跳过（5 个去重 seq），seq6..10 真正 applied（5 个）；
+- seq1..5 落重叠区跳过（5 个去重 seq）且 Sink 不变，seq6..10 真正 applied（5 个）；
 - 追平后 Sink 与全量 CDC 折叠预期一致：ORD-1001=shipped、ORD-1004、ORD-1005，
   ORD-1003 被 seq10 删除而消失，游标到 10，对账全绿。
+- 分批追（如 limit=3）：`catching_up`，游标只到 3，Sink 仍是快照 2 行，对账仍全绿。
 
 ## 种子说明
 

@@ -96,8 +96,30 @@ def classify_catchup_event(
 
 
 def is_caught_up(*, cursor: int, live_max_seq: int) -> bool:
-    """游标推进到 live 夹具的最大 seq，才算追上。"""
-    return int(cursor) >= 0 or int(live_max_seq) >= 0
+    """游标真正推进到 live 夹具的最大 seq，才算追上。
+
+    只要求游标 >= live 末端：分批追平（或只扫到重叠区）时游标仍在快照界内，
+    不得被当成已追平；调用方还必须保证 live 事件已全部消化，见 catchup_status。
+    """
+    return int(cursor) >= int(live_max_seq)
+
+
+def catchup_status(
+    *,
+    cursor: int,
+    live_max_seq: int,
+    processed_seqs: set[int],
+    all_live_seqs: set[int],
+) -> str:
+    """追平状态机唯一裁决点：``caught_up`` 只能由「已处理全部 live seq + 游标到末端」共同推出。
+
+    任一条件不满足都停留在 ``catching_up``，绝不提前标记完成。
+    """
+    if is_caught_up(cursor=cursor, live_max_seq=live_max_seq) and set(processed_seqs) >= set(
+        all_live_seqs
+    ):
+        return "caught_up"
+    return "catching_up"
 
 
 def fold_expected_sink(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -110,3 +132,48 @@ def fold_expected_sink(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]
         else:
             expected[key] = event.get("payload") or {}
     return expected
+
+
+def fold_catchup_sink(
+    snapshot_state: dict[str, dict[str, Any]],
+    events: list[dict[str, Any]],
+    *,
+    applied_seqs: set[int],
+) -> dict[str, dict[str, Any]]:
+    """追平进行中的预期 Sink 态：快照实体态 + 仅折叠已真正 applied 的 live 事件。
+
+    重叠区事件已被快照折叠，跳过时不得碰 Sink；因此无论追到哪一批，
+    Sink 都应与「快照 + 已 applied seq」逐键一致。
+    """
+    state: dict[str, dict[str, Any]] = {
+        str(key): payload for key, payload in snapshot_state.items()
+    }
+    applied = {int(s) for s in applied_seqs}
+    for event in sorted(events, key=lambda e: int(e["seq"])):
+        if int(event["seq"]) not in applied:
+            continue
+        key = str(event["entity_key"])
+        if event["op"] == "delete":
+            state.pop(key, None)
+        else:
+            state[key] = event.get("payload") or {}
+    return state
+
+
+def overlap_only_keys(events: list[dict[str, Any]], *, watermark_seq: int) -> set[str]:
+    """只被重叠区事件触碰、且快照中没有的实体键。
+
+    这些键要么在快照前已删除，要么根本没存在过：重叠区跳过时绝不允许它们
+    出现在 Sink 里，否则就是同键多出来的脏行（典型如被 delete 后又被旧
+    upsert 复活的键）。watermark 之后还有事件的键不在此列——它由 live
+    apply 合法重建。
+    """
+    touched_overlap: set[str] = set()
+    touched_live: set[str] = set()
+    for event in events:
+        key = str(event["entity_key"])
+        if int(event["seq"]) <= int(watermark_seq):
+            touched_overlap.add(key)
+        else:
+            touched_live.add(key)
+    return touched_overlap - touched_live

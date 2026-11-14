@@ -13,17 +13,23 @@ from __future__ import annotations
 from app.modules.snapshot_catchup_race.engine import (
     OVERLAP_DISPOSITION,
     SNAPSHOT_LOADED_DISPOSITION,
+    catchup_status,
     classify_catchup_event,
+    fold_catchup_sink,
     fold_expected_sink,
     is_caught_up,
+    overlap_only_keys,
     parse_snapshot_fixture,
 )
 
 __all__ = [
     "OVERLAP_DISPOSITION",
     "SNAPSHOT_LOADED_DISPOSITION",
+    "catchup_status",
     "classify_catchup_event",
+    "fold_catchup_sink",
     "fold_expected_sink",
     "is_caught_up",
+    "overlap_only_keys",
     "parse_snapshot_fixture",
 ]
